@@ -2,6 +2,7 @@
 
 use super::arch::ArchReport;
 use super::{FileMetric, FuncMetric, HealthReport};
+use crate::core::snapshot::{flatten_files_ref, Snapshot};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 
@@ -43,6 +44,25 @@ pub struct AdviceReport {
     pub summary: AdviceSummary,
     pub targets: Vec<AdviceTarget>,
     pub cycles: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionDetail {
+    pub name: String,
+    pub cyclomatic_complexity: Option<u32>,
+    pub lines: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileDetailReport {
+    pub path: String,
+    pub found: bool,
+    pub language: Option<String>,
+    pub lines: Option<u32>,
+    pub functions: Vec<FunctionDetail>,
+    pub imports: Vec<String>,
+    pub imported_by: Vec<String>,
+    pub blast_radius: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +208,62 @@ pub fn build_advice_report_from_parts(parts: AdviceParts) -> AdviceReport {
     }
 }
 
+pub fn build_file_detail_report(
+    snapshot: &Snapshot,
+    import_graph: &[crate::core::types::ImportEdge],
+    arch: Option<&ArchReport>,
+    path: &str,
+) -> FileDetailReport {
+    let files = flatten_files_ref(&snapshot.root);
+    let file = files.iter().find(|node| node.path == path);
+    let functions = file
+        .and_then(|node| node.sa.as_ref())
+        .and_then(|analysis| analysis.functions.as_ref())
+        .map(|functions| {
+            let mut details: Vec<FunctionDetail> = functions
+                .iter()
+                .map(|function| FunctionDetail {
+                    name: function.n.clone(),
+                    cyclomatic_complexity: function.cc,
+                    lines: function.ln,
+                })
+                .collect();
+            details.sort_by(|a, b| {
+                b.cyclomatic_complexity
+                    .unwrap_or(0)
+                    .cmp(&a.cyclomatic_complexity.unwrap_or(0))
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            details
+        })
+        .unwrap_or_default();
+
+    let mut imports: Vec<String> = import_graph
+        .iter()
+        .filter(|edge| edge.from_file == path)
+        .map(|edge| edge.to_file.clone())
+        .collect();
+    imports.sort();
+
+    let mut imported_by: Vec<String> = import_graph
+        .iter()
+        .filter(|edge| edge.to_file == path)
+        .map(|edge| edge.from_file.clone())
+        .collect();
+    imported_by.sort();
+
+    FileDetailReport {
+        path: path.into(),
+        found: file.is_some(),
+        language: file.map(|node| node.lang.clone()),
+        lines: file.map(|node| node.lines),
+        functions,
+        imports,
+        imported_by,
+        blast_radius: arch.and_then(|report| report.blast_radius.get(path).copied()),
+    }
+}
+
 impl AdviceReport {
     fn with_main_sequence_distance(mut self, value: Option<f64>) -> Self {
         self.summary.main_sequence_distance = value;
@@ -277,5 +353,15 @@ mod tests {
         assert_eq!(value["targets"][0]["category"], "god_file");
         assert!(value["targets"][0]["evidence"]["fan_out"].is_number());
         assert!(value["cycles"].is_array());
+    }
+
+    #[test]
+    fn file_detail_reports_missing_file() {
+        let snapshot = crate::metrics::test_helpers::snap_with_edges(vec![], vec![]);
+        let detail = build_file_detail_report(&snapshot, &[], None, "src/missing.rs");
+        assert_eq!(detail.path, "src/missing.rs");
+        assert!(!detail.found);
+        assert!(detail.imports.is_empty());
+        assert!(detail.imported_by.is_empty());
     }
 }

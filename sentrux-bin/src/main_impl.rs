@@ -121,6 +121,19 @@ enum Command {
         format: OutputFormat,
     },
 
+    /// Print focused metrics for one file
+    FileDetail {
+        /// Directory to inspect
+        path: String,
+
+        /// Repo-relative file path
+        file: String,
+
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+
     /// Open the GUI with a pre-loaded directory
     Scan {
         /// Directory to visualize
@@ -247,6 +260,9 @@ pub fn run() -> eframe::Result<()> {
         }
         Some(Command::Diagnostics { path, limit, format }) => {
             std::process::exit(run_diagnostics(&path, limit, format));
+        }
+        Some(Command::FileDetail { path, file, format }) => {
+            std::process::exit(run_file_detail(&path, &file, format));
         }
         Some(Command::Mcp) => {
             app::mcp_server::run_mcp_server(None);
@@ -661,6 +677,70 @@ fn print_diagnostics_report(report: &metrics::advisor::AdviceReport) {
                 target.category, target.path, target.priority
             ),
         }
+    }
+}
+
+fn run_file_detail(path: &str, file: &str, format: OutputFormat) -> i32 {
+    let root = std::path::Path::new(path);
+    if !root.is_dir() {
+        eprintln!("Error: not a directory: {path}");
+        return 1;
+    }
+
+    eprintln!("Scanning {path}...");
+    let result = match analysis::scanner::scan_directory(
+        path, None, None,
+        &cli_scan_limits(),
+        None,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Scan failed: {e}");
+            return 1;
+        }
+    };
+    let arch_report = metrics::arch::compute_arch(&result.snapshot);
+    let report = metrics::advisor::build_file_detail_report(
+        &result.snapshot,
+        &result.snapshot.import_graph,
+        Some(&arch_report),
+        file,
+    );
+
+    match format {
+        OutputFormat::Text => print_file_detail_report(&report),
+        OutputFormat::Json => match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("Failed to render JSON: {e}");
+                return 1;
+            }
+        },
+    }
+    if report.found { 0 } else { 1 }
+}
+
+fn print_file_detail_report(report: &metrics::advisor::FileDetailReport) {
+    println!("sentrux file-detail\n");
+    println!("Path:  {}", report.path);
+    println!("Found: {}", report.found);
+    if let Some(language) = &report.language {
+        println!("Lang:  {language}");
+    }
+    if let Some(lines) = report.lines {
+        println!("Lines: {lines}");
+    }
+    println!("Imports:     {}", report.imports.len());
+    println!("Imported by: {}", report.imported_by.len());
+    if let Some(radius) = report.blast_radius {
+        println!("Blast:       {radius}");
+    }
+    for function in report.functions.iter().take(20) {
+        println!(
+            "  {} cc={}",
+            function.name,
+            function.cyclomatic_complexity.unwrap_or(0)
+        );
     }
 }
 
@@ -1306,6 +1386,26 @@ mod tests {
                 assert_eq!(format, OutputFormat::Json);
             }
             _ => panic!("expected diagnostics command"),
+        }
+    }
+
+    #[test]
+    fn parses_file_detail_json_format() {
+        let cli = Cli::try_parse_from([
+            "sentrux",
+            "file-detail",
+            ".",
+            "src/main.rs",
+            "--format",
+            "json",
+        ]).unwrap();
+        match cli.command {
+            Some(Command::FileDetail { path, file, format }) => {
+                assert_eq!(path, ".");
+                assert_eq!(file, "src/main.rs");
+                assert_eq!(format, OutputFormat::Json);
+            }
+            _ => panic!("expected file-detail command"),
         }
     }
 }
