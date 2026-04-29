@@ -669,12 +669,12 @@ fn print_diagnostics_report(report: &metrics::advisor::AdviceReport) {
     for target in &report.targets {
         match &target.symbol {
             Some(symbol) => println!(
-                "  {:?}: {}::{} priority={:.2}",
-                target.category, target.path, symbol, target.priority
+                "  {}: {}::{} priority={:.2}",
+                target.category.label(), target.path, symbol, target.priority
             ),
             None => println!(
-                "  {:?}: {} priority={:.2}",
-                target.category, target.path, target.priority
+                "  {}: {} priority={:.2}",
+                target.category.label(), target.path, target.priority
             ),
         }
     }

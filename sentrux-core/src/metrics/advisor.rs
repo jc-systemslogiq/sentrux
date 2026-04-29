@@ -16,6 +16,18 @@ pub enum AdviceCategory {
     LongFunction,
 }
 
+impl AdviceCategory {
+    pub fn label(&self) -> &'static str {
+        match self {
+            AdviceCategory::GodFile => "god_file",
+            AdviceCategory::Hotspot => "hotspot",
+            AdviceCategory::Cycle => "cycle",
+            AdviceCategory::ComplexFunction => "complex_function",
+            AdviceCategory::LongFunction => "long_function",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AdviceSummary {
     pub quality_signal: u32,
@@ -363,5 +375,61 @@ mod tests {
         assert!(!detail.found);
         assert!(detail.imports.is_empty());
         assert!(detail.imported_by.is_empty());
+    }
+
+    #[test]
+    fn file_detail_reports_functions_edges_and_blast_radius() {
+        let mut target = crate::metrics::test_helpers::file("src/target.rs");
+        target.lines = 42;
+        target.sa = Some(crate::core::types::StructuralAnalysis {
+            functions: Some(vec![crate::core::types::FuncInfo {
+                n: "run".into(),
+                sl: 1,
+                el: 12,
+                ln: 12,
+                cc: Some(7),
+                cog: None,
+                pc: None,
+                bh: None,
+                d: None,
+                co: None,
+                is_public: false,
+                is_method: false,
+            }]),
+            cls: None,
+            imp: None,
+            co: None,
+            tags: None,
+            comment_lines: None,
+        });
+        let edges = vec![
+            crate::metrics::test_helpers::edge("src/target.rs", "src/dep.rs"),
+            crate::metrics::test_helpers::edge("src/caller.rs", "src/target.rs"),
+        ];
+        let snapshot = crate::metrics::test_helpers::snap_with_edges(
+            edges.clone(),
+            vec![
+                target,
+                crate::metrics::test_helpers::file("src/dep.rs"),
+                crate::metrics::test_helpers::file("src/caller.rs"),
+            ],
+        );
+        let arch = crate::metrics::arch::compute_arch(&snapshot);
+
+        let detail = build_file_detail_report(
+            &snapshot,
+            &snapshot.import_graph,
+            Some(&arch),
+            "src/target.rs",
+        );
+
+        assert!(detail.found);
+        assert_eq!(detail.lines, Some(42));
+        assert_eq!(detail.functions[0].name, "run");
+        assert_eq!(detail.functions[0].cyclomatic_complexity, Some(7));
+        assert_eq!(detail.functions[0].lines, 12);
+        assert_eq!(detail.imports, vec!["src/dep.rs"]);
+        assert_eq!(detail.imported_by, vec!["src/caller.rs"]);
+        assert_eq!(detail.blast_radius, Some(1));
     }
 }

@@ -78,6 +78,7 @@ sentrux gate --save .      # save baseline before agent session
 sentrux gate .             # compare after — catches degradation
 sentrux debt .             # print advisory refactoring targets
 sentrux diagnostics . --format json  # machine-readable agent diagnostics
+sentrux file-detail . src/main.rs --format json  # focused file metrics
 ```
 
 **Connect to your AI agent (optional)**
