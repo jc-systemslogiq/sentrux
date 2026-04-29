@@ -11,6 +11,8 @@ sentrux diagnostics . --limit 10 --format json
 sentrux file-detail . path/to/file.ts --format json
 sentrux what-if . --remove-file path/to/file.ts --format json
 sentrux what-if . --remove-edge from.ts:to.ts --format json
+sentrux what-if . --move-file old/path.ts:new/path.ts --format json
+sentrux what-if . --break-cycle a.ts,b.ts,c.ts --format json
 sentrux gate --save .
 sentrux gate .
 ```

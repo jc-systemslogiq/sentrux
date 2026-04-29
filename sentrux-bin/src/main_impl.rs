@@ -1571,6 +1571,69 @@ mod tests {
     }
 
     #[test]
+    fn parses_what_if_remove_file_json_command() {
+        let cli = Cli::try_parse_from([
+            "sentrux",
+            "what-if",
+            ".",
+            "--remove-file",
+            "src/main.rs",
+            "--format",
+            "json",
+        ]).unwrap();
+        match cli.command {
+            Some(Command::WhatIf { path, remove_file, format, .. }) => {
+                assert_eq!(path, ".");
+                assert_eq!(remove_file.as_deref(), Some("src/main.rs"));
+                assert_eq!(format, OutputFormat::Json);
+            }
+            _ => panic!("expected what-if command"),
+        }
+    }
+
+    #[test]
+    fn parses_what_if_move_file_json_command() {
+        let cli = Cli::try_parse_from([
+            "sentrux",
+            "what-if",
+            ".",
+            "--move-file",
+            "old.rs:new.rs",
+            "--format",
+            "json",
+        ]).unwrap();
+        match cli.command {
+            Some(Command::WhatIf { path, move_file, format, .. }) => {
+                assert_eq!(path, ".");
+                assert_eq!(move_file.as_deref(), Some("old.rs:new.rs"));
+                assert_eq!(format, OutputFormat::Json);
+            }
+            _ => panic!("expected what-if command"),
+        }
+    }
+
+    #[test]
+    fn parses_what_if_break_cycle_json_command() {
+        let cli = Cli::try_parse_from([
+            "sentrux",
+            "what-if",
+            ".",
+            "--break-cycle",
+            "a.rs,b.rs,c.rs",
+            "--format",
+            "json",
+        ]).unwrap();
+        match cli.command {
+            Some(Command::WhatIf { path, break_cycle, format, .. }) => {
+                assert_eq!(path, ".");
+                assert_eq!(break_cycle.as_deref(), Some("a.rs,b.rs,c.rs"));
+                assert_eq!(format, OutputFormat::Json);
+            }
+            _ => panic!("expected what-if command"),
+        }
+    }
+
+    #[test]
     fn rejects_multiple_what_if_actions() {
         let error = parse_what_if_action(
             Some("a.rs:b.rs".into()),

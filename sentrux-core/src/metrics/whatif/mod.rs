@@ -338,7 +338,7 @@ fn compute_level_changes(
     changes.sort_by(|a, b| {
         let a_delta = (a.level_before as i64 - a.level_after as i64).abs();
         let b_delta = (b.level_before as i64 - b.level_after as i64).abs();
-        b_delta.cmp(&a_delta)
+        b_delta.cmp(&a_delta).then_with(|| a.file.cmp(&b.file))
     });
 
     changes
