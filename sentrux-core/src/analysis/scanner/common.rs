@@ -167,7 +167,8 @@ pub(crate) fn should_ignore_file(path: &Path) -> bool {
 
 /// Load project-local scan exclusions.
 ///
-/// Each line in `.sentrux/exclude` or `.sentrux/ignore` is a repo-relative path.
+/// Each line in `.sentrux/exclude` or `.sentrux/ignore` is a repo-relative path
+/// or gitignore-style glob using `*`, `?`, and `**`.
 /// Blank lines and comments are ignored. Directory entries should end in `/`;
 /// entries without a trailing slash match either that exact path or its children.
 pub(crate) fn load_project_excludes(root: &Path) -> Vec<String> {
@@ -205,12 +206,90 @@ pub(crate) fn is_project_excluded(rel_path: &str, excludes: &[String]) -> bool {
     let rel = rel_path.trim_start_matches("./").trim_start_matches('/');
     excludes.iter().any(|pattern| {
         let pattern = pattern.as_str();
+        if contains_glob(pattern) {
+            return glob_exclude_matches(pattern, rel);
+        }
         if pattern.ends_with('/') {
             rel.starts_with(pattern)
         } else {
             rel == pattern || rel.starts_with(&format!("{pattern}/"))
         }
     })
+}
+
+fn contains_glob(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
+fn glob_exclude_matches(pattern: &str, rel: &str) -> bool {
+    let pattern = pattern.trim_start_matches("./").trim_start_matches('/');
+    let rel = rel.trim_start_matches("./").trim_start_matches('/');
+    let directory_prefix = pattern.ends_with('/');
+    let pattern = pattern.trim_end_matches('/');
+    let pattern_segments = split_path_segments(pattern);
+    let rel_segments = split_path_segments(rel);
+
+    if directory_prefix {
+        glob_segments_match_prefix(&pattern_segments, &rel_segments)
+    } else {
+        glob_segments_match(&pattern_segments, &rel_segments)
+    }
+}
+
+fn split_path_segments(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn glob_segments_match_prefix(pattern: &[&str], rel: &[&str]) -> bool {
+    (0..=rel.len()).any(|end| glob_segments_match(pattern, &rel[..end]))
+}
+
+fn glob_segments_match(pattern: &[&str], rel: &[&str]) -> bool {
+    match (pattern.split_first(), rel.split_first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some((&"**", rest)), _) => {
+            glob_segments_match(rest, rel)
+                || (!rel.is_empty() && glob_segments_match(pattern, &rel[1..]))
+        }
+        (Some((_, _)), None) => false,
+        (Some((&segment_pattern, pattern_rest)), Some((&segment, rel_rest))) => {
+            glob_segment_matches(segment_pattern, segment)
+                && glob_segments_match(pattern_rest, rel_rest)
+        }
+    }
+}
+
+fn glob_segment_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
+    let mut pattern_index = 0;
+    let mut text_index = 0;
+    let mut star_index = None;
+    let mut star_text_index = 0;
+
+    while text_index < text.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == text[text_index])
+        {
+            pattern_index += 1;
+            text_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            star_text_index = text_index;
+            pattern_index += 1;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            star_text_index += 1;
+            text_index = star_text_index;
+        } else {
+            return false;
+        }
+    }
+
+    pattern[pattern_index..].iter().all(|&byte| byte == b'*')
 }
 
 /// Line counts computed from raw file content (no external dependency).
@@ -256,7 +335,7 @@ pub(crate) fn count_lines_from_bytes(content: &[u8]) -> LineCounts {
 
 #[cfg(test)]
 mod tests {
-    use super::is_project_excluded;
+    use super::{is_project_excluded, normalize_exclude_pattern};
 
     #[test]
     fn project_excludes_directory_without_matching_sibling_prefixes() {
@@ -278,5 +357,36 @@ mod tests {
         assert!(is_project_excluded("legacy", &excludes));
         assert!(is_project_excluded("legacy/src/index.ts", &excludes));
         assert!(!is_project_excluded("legacy-next/src/index.ts", &excludes));
+    }
+
+    #[test]
+    fn project_excludes_glob_patterns() {
+        let excludes = vec![
+            normalize_exclude_pattern("**/__tests__/**"),
+            normalize_exclude_pattern("**/*.spec.ts"),
+            normalize_exclude_pattern("**/*.test.ts"),
+            normalize_exclude_pattern("frontend/amplify/**"),
+        ];
+
+        assert!(is_project_excluded(
+            "frontend/src/pages/__tests__/UnifiedDiagramView.spec.ts",
+            &excludes
+        ));
+        assert!(is_project_excluded(
+            "api-next/src/modules/assistant/service.test.ts",
+            &excludes
+        ));
+        assert!(is_project_excluded(
+            "frontend/src/pages/UnifiedDiagramView.spec.ts",
+            &excludes
+        ));
+        assert!(is_project_excluded(
+            "frontend/amplify/auth/resource.ts",
+            &excludes
+        ));
+        assert!(!is_project_excluded(
+            "frontend/src/features/diagrams/runtime/useDiagramRuntimeSession.ts",
+            &excludes
+        ));
     }
 }
