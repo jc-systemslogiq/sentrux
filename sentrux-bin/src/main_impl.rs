@@ -6,6 +6,7 @@
 //! - MCP mode (`sentrux mcp`): Model Context Protocol server for AI agent integration
 //! - Check mode (`sentrux check [path]`): CLI architectural rules enforcement
 //! - Gate mode (`sentrux gate [--save] [path]`): structural regression testing
+//! - Debt mode (`sentrux debt [path]`): advisory refactoring target report
 
 use clap::{Parser, Subcommand};
 use sentrux_core::analysis;
@@ -82,6 +83,17 @@ enum Command {
         /// Directory to gate
         #[arg(default_value = ".")]
         path: String,
+    },
+
+    /// Print advisory architecture debt targets without failing the build
+    Debt {
+        /// Directory to inspect
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Maximum rows to print per section
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
     },
 
     /// Open the GUI with a pre-loaded directory
@@ -204,6 +216,9 @@ pub fn run() -> eframe::Result<()> {
         }
         Some(Command::Gate { save, path }) => {
             std::process::exit(run_gate(&path, save));
+        }
+        Some(Command::Debt { path, limit }) => {
+            std::process::exit(run_debt(&path, limit));
         }
         Some(Command::Mcp) => {
             app::mcp_server::run_mcp_server(None);
@@ -462,7 +477,7 @@ fn run_check(path: &str) -> i32 {
 fn print_check_results(
     check: &metrics::rules::RuleCheckResult,
     health: &metrics::HealthReport,
-    arch_report: &metrics::arch::ArchReport,
+    _arch_report: &metrics::arch::ArchReport,
 ) -> i32 {
     println!("sentrux check — {} rules checked\n", check.rules_checked);
     println!("Quality: {}\n",
@@ -484,6 +499,129 @@ fn print_check_results(
         }
         println!("\n✗ {} violation(s) found", check.violations.len());
         1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Debt
+// ---------------------------------------------------------------------------
+
+/// Print advisory refactoring targets from the same scan data used by check/gate.
+/// This command is intentionally non-failing: use `check` or `gate` for CI policy.
+fn run_debt(path: &str, limit: usize) -> i32 {
+    let root = std::path::Path::new(path);
+    if !root.is_dir() {
+        eprintln!("Error: not a directory: {path}");
+        return 1;
+    }
+
+    eprintln!("Scanning {path}...");
+    let result = match analysis::scanner::scan_directory(
+        path, None, None,
+        &cli_scan_limits(),
+        None,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Scan failed: {e}");
+            return 1;
+        }
+    };
+
+    let health = metrics::compute_health(&result.snapshot);
+    let arch_report = metrics::arch::compute_arch(&result.snapshot);
+
+    print_debt_report(&health, &arch_report, limit.max(1));
+    0
+}
+
+fn print_debt_report(
+    health: &metrics::HealthReport,
+    arch_report: &metrics::arch::ArchReport,
+    limit: usize,
+) {
+    println!("sentrux debt — advisory refactoring targets\n");
+    println!("Quality:      {}",
+        (health.quality_signal * 10000.0).round() as u32);
+    println!("Coupling:     {:.2}", health.coupling_score);
+    println!("Cycles:       {}", health.circular_dep_count);
+    println!("God files:    {}", health.god_files.len());
+    println!("Hotspots:     {}", health.hotspot_files.len());
+    println!("Complex fns:  {}", health.complex_functions.len());
+    println!("Long fns:     {}", health.long_functions.len());
+    if !arch_report.distance_metrics.is_empty() {
+        println!("Main seq dist: {:.2}", arch_report.avg_distance);
+    }
+
+    print_file_metric_section("God files by fan-out", &health.god_files, "fan-out", limit);
+    print_file_metric_section("Hotspots by fan-in", &health.hotspot_files, "fan-in", limit);
+    print_cycles(&health.circular_dep_files, limit);
+    print_func_metric_section(
+        "Complex functions by cyclomatic complexity",
+        &health.complex_functions,
+        "cc",
+        limit,
+    );
+    print_func_metric_section(
+        "Long functions by line count",
+        &health.long_functions,
+        "lines",
+        limit,
+    );
+}
+
+fn print_file_metric_section(
+    title: &str,
+    metrics: &[metrics::FileMetric],
+    label: &str,
+    limit: usize,
+) {
+    println!("\n{title}");
+    if metrics.is_empty() {
+        println!("  none");
+        return;
+    }
+
+    for metric in metrics.iter().take(limit) {
+        println!("  {} ({}={})", metric.path, label, metric.value);
+    }
+    print_more_count(metrics.len(), limit);
+}
+
+fn print_func_metric_section(
+    title: &str,
+    metrics: &[metrics::FuncMetric],
+    label: &str,
+    limit: usize,
+) {
+    println!("\n{title}");
+    if metrics.is_empty() {
+        println!("  none");
+        return;
+    }
+
+    for metric in metrics.iter().take(limit) {
+        println!("  {}::{} ({}={})", metric.file, metric.func, label, metric.value);
+    }
+    print_more_count(metrics.len(), limit);
+}
+
+fn print_cycles(cycles: &[Vec<String>], limit: usize) {
+    println!("\nCycles");
+    if cycles.is_empty() {
+        println!("  none");
+        return;
+    }
+
+    for (index, cycle) in cycles.iter().take(limit).enumerate() {
+        println!("  {}. {}", index + 1, cycle.join(" -> "));
+    }
+    print_more_count(cycles.len(), limit);
+}
+
+fn print_more_count(total: usize, limit: usize) {
+    if total > limit {
+        println!("  ... {} more", total - limit);
     }
 }
 
@@ -527,7 +665,7 @@ fn run_gate(path: &str, save_mode: bool) -> i32 {
 fn gate_save(
     baseline_path: &std::path::Path,
     health: &metrics::HealthReport,
-    arch_report: &metrics::arch::ArchReport,
+    _arch_report: &metrics::arch::ArchReport,
 ) -> i32 {
     if let Some(parent) = baseline_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
