@@ -81,6 +81,8 @@ sentrux diagnostics . --format json  # machine-readable agent diagnostics
 sentrux file-detail . src/main.rs --format json  # focused file metrics
 ```
 
+For CLI-first agent workflows, see [CLI Advisor](docs/cli-advisor.md).
+
 **Connect to your AI agent (optional)**
 
 Give your agent real-time access to structural health via [MCP](https://modelcontextprotocol.io).
