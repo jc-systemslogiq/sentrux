@@ -256,4 +256,26 @@ mod tests {
         assert!(report.targets[0].priority > report.targets[1].priority);
         assert_eq!(report.summary.quality_signal, 4200);
     }
+
+    #[test]
+    fn serializes_advice_report_shape_for_cli_json() {
+        let report = build_advice_report_from_parts(AdviceParts {
+            quality_signal: 0.42,
+            coupling_score: 0.31,
+            cycle_count: 1,
+            max_depth: 8,
+            god_files: vec![FileMetric { path: "src/risky.rs".into(), value: 16 }],
+            hotspot_files: vec![],
+            complex_functions: vec![],
+            long_functions: vec![],
+            cycles: vec![vec!["src/a.rs".into(), "src/b.rs".into()]],
+            limit: 10,
+        });
+
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["summary"]["quality_signal"], 4200);
+        assert_eq!(value["targets"][0]["category"], "god_file");
+        assert!(value["targets"][0]["evidence"]["fan_out"].is_number());
+        assert!(value["cycles"].is_array());
+    }
 }
