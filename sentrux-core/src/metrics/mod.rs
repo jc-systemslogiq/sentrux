@@ -8,6 +8,7 @@
 //! Key function: `compute_health` produces a `HealthReport` from a `Snapshot`.
 
 // ── Sub-modules (directory modules with internal cohesion) ──
+pub mod advisor;
 pub mod arch;     // arch/mod.rs + graph.rs + distance.rs
 pub mod evo;      // evo/mod.rs + git_walker.rs
 pub mod rules;    // rules/mod.rs + checks.rs
