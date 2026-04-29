@@ -65,6 +65,12 @@ struct Cli {
     mcp_flag: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Enforce architectural rules defined in .sentrux/rules.toml
@@ -94,6 +100,10 @@ enum Command {
         /// Maximum rows to print per section
         #[arg(long, default_value_t = 10)]
         limit: usize,
+
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
 
     /// Open the GUI with a pre-loaded directory
@@ -217,8 +227,8 @@ pub fn run() -> eframe::Result<()> {
         Some(Command::Gate { save, path }) => {
             std::process::exit(run_gate(&path, save));
         }
-        Some(Command::Debt { path, limit }) => {
-            std::process::exit(run_debt(&path, limit));
+        Some(Command::Debt { path, limit, format }) => {
+            std::process::exit(run_debt(&path, limit, format));
         }
         Some(Command::Mcp) => {
             app::mcp_server::run_mcp_server(None);
@@ -508,7 +518,7 @@ fn print_check_results(
 
 /// Print advisory refactoring targets from the same scan data used by check/gate.
 /// This command is intentionally non-failing: use `check` or `gate` for CI policy.
-fn run_debt(path: &str, limit: usize) -> i32 {
+fn run_debt(path: &str, limit: usize, format: OutputFormat) -> i32 {
     let root = std::path::Path::new(path);
     if !root.is_dir() {
         eprintln!("Error: not a directory: {path}");
@@ -530,8 +540,18 @@ fn run_debt(path: &str, limit: usize) -> i32 {
 
     let health = metrics::compute_health(&result.snapshot);
     let arch_report = metrics::arch::compute_arch(&result.snapshot);
+    let report = metrics::advisor::build_advice_report(&health, &arch_report, limit.max(1));
 
-    print_debt_report(&health, &arch_report, limit.max(1));
+    match format {
+        OutputFormat::Text => print_debt_report(&health, &arch_report, limit.max(1)),
+        OutputFormat::Json => match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("Failed to render JSON: {e}");
+                return 1;
+            }
+        },
+    }
     0
 }
 
@@ -1178,4 +1198,19 @@ fn ensure_grammars_installed() {
         eprintln!("  URL: {url}");
     }
     eprintln!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_debt_json_format() {
+        let cli = Cli::try_parse_from(["sentrux", "debt", ".", "--format", "json"]).unwrap();
+        match cli.command {
+            Some(Command::Debt { format, .. }) => assert_eq!(format, OutputFormat::Json),
+            _ => panic!("expected debt command"),
+        }
+    }
 }
