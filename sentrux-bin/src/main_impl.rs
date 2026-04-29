@@ -106,6 +106,21 @@ enum Command {
         format: OutputFormat,
     },
 
+    /// Print root-cause-organized architecture diagnostics
+    Diagnostics {
+        /// Directory to inspect
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Maximum rows to print per section
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+
     /// Open the GUI with a pre-loaded directory
     Scan {
         /// Directory to visualize
@@ -229,6 +244,9 @@ pub fn run() -> eframe::Result<()> {
         }
         Some(Command::Debt { path, limit, format }) => {
             std::process::exit(run_debt(&path, limit, format));
+        }
+        Some(Command::Diagnostics { path, limit, format }) => {
+            std::process::exit(run_diagnostics(&path, limit, format));
         }
         Some(Command::Mcp) => {
             app::mcp_server::run_mcp_server(None);
@@ -588,6 +606,62 @@ fn print_debt_report(
         "lines",
         limit,
     );
+}
+
+fn run_diagnostics(path: &str, limit: usize, format: OutputFormat) -> i32 {
+    let root = std::path::Path::new(path);
+    if !root.is_dir() {
+        eprintln!("Error: not a directory: {path}");
+        return 1;
+    }
+
+    eprintln!("Scanning {path}...");
+    let result = match analysis::scanner::scan_directory(
+        path, None, None,
+        &cli_scan_limits(),
+        None,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Scan failed: {e}");
+            return 1;
+        }
+    };
+
+    let health = metrics::compute_health(&result.snapshot);
+    let arch_report = metrics::arch::compute_arch(&result.snapshot);
+    let report = metrics::advisor::build_advice_report(&health, &arch_report, limit.max(1));
+
+    match format {
+        OutputFormat::Text => print_diagnostics_report(&report),
+        OutputFormat::Json => match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("Failed to render JSON: {e}");
+                return 1;
+            }
+        },
+    }
+    0
+}
+
+fn print_diagnostics_report(report: &metrics::advisor::AdviceReport) {
+    println!("sentrux diagnostics - root-cause refactoring queue\n");
+    println!("Quality: {}", report.summary.quality_signal);
+    println!("Cycles:  {}", report.summary.cycle_count);
+    println!("Targets:");
+    for target in &report.targets {
+        match &target.symbol {
+            Some(symbol) => println!(
+                "  {:?}: {}::{} priority={:.2}",
+                target.category, target.path, symbol, target.priority
+            ),
+            None => println!(
+                "  {:?}: {} priority={:.2}",
+                target.category, target.path, target.priority
+            ),
+        }
+    }
 }
 
 fn print_file_metric_section(
@@ -1211,6 +1285,27 @@ mod tests {
         match cli.command {
             Some(Command::Debt { format, .. }) => assert_eq!(format, OutputFormat::Json),
             _ => panic!("expected debt command"),
+        }
+    }
+
+    #[test]
+    fn parses_diagnostics_json_format() {
+        let cli = Cli::try_parse_from([
+            "sentrux",
+            "diagnostics",
+            ".",
+            "--limit",
+            "5",
+            "--format",
+            "json",
+        ]).unwrap();
+        match cli.command {
+            Some(Command::Diagnostics { path, limit, format }) => {
+                assert_eq!(path, ".");
+                assert_eq!(limit, 5);
+                assert_eq!(format, OutputFormat::Json);
+            }
+            _ => panic!("expected diagnostics command"),
         }
     }
 }

@@ -76,6 +76,8 @@ sentrux /path/to/project   # open GUI scanning a specific directory
 sentrux check .            # check rules (CI-friendly, exits 0 or 1)
 sentrux gate --save .      # save baseline before agent session
 sentrux gate .             # compare after — catches degradation
+sentrux debt .             # print advisory refactoring targets
+sentrux diagnostics . --format json  # machine-readable agent diagnostics
 ```
 
 **Connect to your AI agent (optional)**
