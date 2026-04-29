@@ -4,12 +4,12 @@
 //! tree/graph rebuilding for changed files only.
 
 use super::common::{
-    ScanLimits, ScanResult, count_lines_from_bytes, detect_lang,
-    should_ignore_dir, should_ignore_file, MAX_FILES,
+    count_lines_from_bytes, detect_lang, is_project_excluded, load_project_excludes,
+    should_ignore_dir, should_ignore_file, ScanLimits, ScanResult, MAX_FILES,
 };
 use super::tree::build_tree;
-use crate::core::types::AppError;
 use crate::core::snapshot::Snapshot;
+use crate::core::types::AppError;
 use crate::core::types::FileNode;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -31,13 +31,20 @@ pub fn rescan_changed(
     let max_file_size_bytes = limits.max_file_size_kb * 1024;
     let max_parse_size = limits.max_parse_size_kb;
     let max_call_targets = limits.max_call_targets;
+    let project_excludes = load_project_excludes(root);
 
     // Flatten old snapshot into a mutable file list (clone cost ~ file count, not content)
     let mut files: Vec<FileNode> = crate::core::snapshot::flatten_files(&old_snap.root);
 
     // Expand directories and classify into reparse vs deleted
-    let expanded = expand_directory_events(root, changed_rel_paths, max_file_size_bytes);
-    let (to_reparse, deleted) = classify_changed_paths(root, &expanded, max_file_size_bytes);
+    let expanded = expand_directory_events(
+        root,
+        changed_rel_paths,
+        &project_excludes,
+        max_file_size_bytes,
+    );
+    let (to_reparse, deleted) =
+        classify_changed_paths(root, &expanded, &project_excludes, max_file_size_bytes);
 
     // Remove deleted files — exact match OR prefix match for deleted directories.
     // When a directory is deleted, macOS FSEvents may only report the directory
@@ -46,15 +53,15 @@ pub fn rescan_changed(
     //
     // Collect directory prefixes once (with trailing '/') to avoid repeated
     // string building inside the hot retain loop.
-    let deleted_dir_prefixes: Vec<String> = deleted.iter()
-        .map(|d| format!("{}/", d))
-        .collect();
+    let deleted_dir_prefixes: Vec<String> = deleted.iter().map(|d| format!("{}/", d)).collect();
     files.retain(|f| {
         if deleted.contains(&f.path) {
             return false;
         }
         // Check if any deleted path is a parent directory of this file
-        deleted_dir_prefixes.iter().all(|prefix| !f.path.starts_with(prefix.as_str()))
+        deleted_dir_prefixes
+            .iter()
+            .all(|prefix| !f.path.starts_with(prefix.as_str()))
     });
 
     // Structural analysis + git statuses (line counts computed inline per file)
@@ -77,13 +84,23 @@ pub fn rescan_changed(
 fn expand_directory_events(
     root: &Path,
     changed_rel_paths: &[String],
+    project_excludes: &[String],
     max_file_size_bytes: u64,
 ) -> Vec<String> {
     let mut expanded: Vec<String> = Vec::new();
     for rel in changed_rel_paths {
+        if is_project_excluded(rel, project_excludes) {
+            continue;
+        }
         let abs = root.join(rel);
         if abs.exists() && abs.is_dir() {
-            expand_single_dir(root, &abs, max_file_size_bytes, &mut expanded);
+            expand_single_dir(
+                root,
+                &abs,
+                project_excludes,
+                max_file_size_bytes,
+                &mut expanded,
+            );
         } else {
             expanded.push(rel.clone());
         }
@@ -99,6 +116,7 @@ fn expand_directory_events(
 fn validate_walk_entry(
     entry: &ignore::DirEntry,
     root: &Path,
+    project_excludes: &[String],
     max_file_size_bytes: u64,
 ) -> Option<String> {
     if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -113,9 +131,14 @@ fn validate_walk_entry(
             return None;
         }
     }
-    path.strip_prefix(root)
+    let rel_path = path
+        .strip_prefix(root)
         .ok()
-        .map(|rel| super::common::normalize_path(rel.to_string_lossy()))
+        .map(|rel| super::common::normalize_path(rel.to_string_lossy()))?;
+    if is_project_excluded(&rel_path, project_excludes) {
+        return None;
+    }
+    Some(rel_path)
 }
 
 /// Walk a single directory and append discovered file rel-paths to `out`.
@@ -123,17 +146,31 @@ fn validate_walk_entry(
 fn expand_single_dir(
     root: &Path,
     dir_abs: &Path,
+    project_excludes: &[String],
     max_file_size_bytes: u64,
     out: &mut Vec<String>,
 ) {
+    let filter_root = root.to_path_buf();
+    let filter_excludes = project_excludes.to_vec();
     for entry in ignore::WalkBuilder::new(dir_abs)
         .hidden(true)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .max_depth(Some(20))
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
             let name = entry.file_name().to_string_lossy();
+            let rel = entry
+                .path()
+                .strip_prefix(&filter_root)
+                .ok()
+                .map(|rel| super::common::normalize_path(rel.to_string_lossy()));
+            if rel
+                .as_deref()
+                .is_some_and(|rel| is_project_excluded(rel, &filter_excludes))
+            {
+                return false;
+            }
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 return !should_ignore_dir(&name);
             }
@@ -142,11 +179,16 @@ fn expand_single_dir(
         .build()
     {
         if out.len() >= MAX_FILES {
-            crate::debug_log!("[rescan] expanded_paths hit MAX_FILES limit ({}), truncating", MAX_FILES);
+            crate::debug_log!(
+                "[rescan] expanded_paths hit MAX_FILES limit ({}), truncating",
+                MAX_FILES
+            );
             break;
         }
         if let Ok(e) = entry {
-            if let Some(rel_path) = validate_walk_entry(&e, root, max_file_size_bytes) {
+            if let Some(rel_path) =
+                validate_walk_entry(&e, root, project_excludes, max_file_size_bytes)
+            {
                 out.push(rel_path);
             }
         }
@@ -158,11 +200,15 @@ fn expand_single_dir(
 fn classify_changed_paths(
     root: &Path,
     expanded: &[String],
+    project_excludes: &[String],
     max_file_size_bytes: u64,
 ) -> (Vec<(String, PathBuf)>, HashSet<String>) {
     let mut to_reparse: Vec<(String, PathBuf)> = Vec::new();
     let mut deleted: HashSet<String> = HashSet::new();
     for rel in expanded {
+        if is_project_excluded(rel, project_excludes) {
+            continue;
+        }
         let abs = root.join(rel);
         if abs.exists() && abs.is_file() {
             if should_ignore_file(&abs) {
@@ -207,7 +253,10 @@ fn build_file_node(
     git_statuses: &HashMap<String, String>,
 ) -> FileNode {
     let mtime = match fs::metadata(abs).and_then(|m| m.modified()) {
-        Ok(t) => t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
+        Ok(t) => t
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64(),
         Err(_) => 0.0,
     };
     let lang = detect_lang(abs);
@@ -222,12 +271,29 @@ fn build_file_node(
     let comments = comment_count;
     let logic = total.saturating_sub(comments).saturating_sub(blanks);
 
-    let funcs = sa.as_ref().and_then(|s| s.functions.as_ref()).map_or(0, |v| v.len() as u32);
+    let funcs = sa
+        .as_ref()
+        .and_then(|s| s.functions.as_ref())
+        .map_or(0, |v| v.len() as u32);
     let gs = git_statuses.get(rel).cloned().unwrap_or_default();
-    let name = abs.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let name = abs
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     FileNode {
-        path: rel.to_string(), name, is_dir: false,
-        lines: total, logic, comments, blanks, funcs, mtime, gs, lang, sa,
+        path: rel.to_string(),
+        name,
+        is_dir: false,
+        lines: total,
+        logic,
+        comments,
+        blanks,
+        funcs,
+        mtime,
+        gs,
+        lang,
+        sa,
         children: None,
     }
 }
@@ -239,8 +305,11 @@ fn upsert_changed_files(
     sa_map: &HashMap<String, crate::core::types::StructuralAnalysis>,
     git_statuses: &HashMap<String, String>,
 ) {
-    let mut file_map: HashMap<String, usize> = files.iter().enumerate()
-        .map(|(i, f)| (f.path.clone(), i)).collect();
+    let mut file_map: HashMap<String, usize> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.path.clone(), i))
+        .collect();
     for (rel, abs) in to_reparse {
         let node = build_file_node(rel, abs, sa_map, git_statuses);
         if let Some(&idx) = file_map.get(rel) {
@@ -268,8 +337,16 @@ fn build_snapshot_with_graphs(
     max_call_targets: usize,
 ) -> Result<ScanResult, AppError> {
     let total_files = files.len() as u32;
-    let total_lines: u32 = files.iter().map(|f| f.lines as u64).sum::<u64>().min(u32::MAX as u64) as u32;
-    let root_name = root.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let total_lines: u32 = files
+        .iter()
+        .map(|f| f.lines as u64)
+        .sum::<u64>()
+        .min(u32::MAX as u64) as u32;
+    let root_name = root
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
 
     let (tree, total_dirs) = build_tree(files, &root_name);
     let tree = Arc::new(tree);
@@ -278,9 +355,13 @@ fn build_snapshot_with_graphs(
     if let Some(cb) = on_tree_ready {
         cb(Snapshot {
             root: Arc::clone(&tree),
-            total_files, total_lines, total_dirs,
-            call_graph: Vec::new(), import_graph: Vec::new(),
-            inherit_graph: Vec::new(), entry_points: Vec::new(),
+            total_files,
+            total_lines,
+            total_dirs,
+            call_graph: Vec::new(),
+            import_graph: Vec::new(),
+            inherit_graph: Vec::new(),
+            entry_points: Vec::new(),
             exec_depth: HashMap::new(),
         });
     }
@@ -292,9 +373,13 @@ fn build_snapshot_with_graphs(
     Ok(ScanResult {
         snapshot: Snapshot {
             root: tree,
-            total_files, total_lines, total_dirs,
-            call_graph: gr.call_edges, import_graph: gr.import_edges,
-            inherit_graph: gr.inherit_edges, entry_points: gr.entry_points,
+            total_files,
+            total_lines,
+            total_dirs,
+            call_graph: gr.call_edges,
+            import_graph: gr.import_edges,
+            inherit_graph: gr.inherit_edges,
+            entry_points: gr.entry_points,
             exec_depth: gr.exec_depth,
         },
     })
@@ -309,9 +394,17 @@ mod tests {
         FileNode {
             path: path.to_string(),
             name: path.rsplit('/').next().unwrap_or(path).to_string(),
-            is_dir: false, lines: 10, logic: 8, comments: 1, blanks: 1,
-            funcs: 1, mtime: 0.0, gs: String::new(), lang: "rust".into(),
-            sa: None, children: None,
+            is_dir: false,
+            lines: 10,
+            logic: 8,
+            comments: 1,
+            blanks: 1,
+            funcs: 1,
+            mtime: 0.0,
+            gs: String::new(),
+            lang: "rust".into(),
+            sa: None,
+            children: None,
         }
     }
 
@@ -327,15 +420,15 @@ mod tests {
         // Watcher reports "src/foo" as deleted (directory deletion on macOS
         // may only report the directory, not individual files within it).
         let deleted: HashSet<String> = ["src/foo".to_string()].into_iter().collect();
-        let deleted_dir_prefixes: Vec<String> = deleted.iter()
-            .map(|d| format!("{}/", d))
-            .collect();
+        let deleted_dir_prefixes: Vec<String> = deleted.iter().map(|d| format!("{}/", d)).collect();
 
         files.retain(|f| {
             if deleted.contains(&f.path) {
                 return false;
             }
-            deleted_dir_prefixes.iter().all(|prefix| !f.path.starts_with(prefix.as_str()))
+            deleted_dir_prefixes
+                .iter()
+                .all(|prefix| !f.path.starts_with(prefix.as_str()))
         });
 
         assert_eq!(files.len(), 1, "Only src/main.rs should survive");
@@ -344,20 +437,17 @@ mod tests {
 
     #[test]
     fn test_individual_file_deletion() {
-        let mut files = vec![
-            make_file("src/foo.rs"),
-            make_file("src/bar.rs"),
-        ];
+        let mut files = vec![make_file("src/foo.rs"), make_file("src/bar.rs")];
         let deleted: HashSet<String> = ["src/foo.rs".to_string()].into_iter().collect();
-        let deleted_dir_prefixes: Vec<String> = deleted.iter()
-            .map(|d| format!("{}/", d))
-            .collect();
+        let deleted_dir_prefixes: Vec<String> = deleted.iter().map(|d| format!("{}/", d)).collect();
 
         files.retain(|f| {
             if deleted.contains(&f.path) {
                 return false;
             }
-            deleted_dir_prefixes.iter().all(|prefix| !f.path.starts_with(prefix.as_str()))
+            deleted_dir_prefixes
+                .iter()
+                .all(|prefix| !f.path.starts_with(prefix.as_str()))
         });
 
         assert_eq!(files.len(), 1);
@@ -366,24 +456,23 @@ mod tests {
 
     #[test]
     fn test_delete_all_files_produces_empty() {
-        let mut files = vec![
-            make_file("src/main.rs"),
-            make_file("src/lib.rs"),
-        ];
+        let mut files = vec![make_file("src/main.rs"), make_file("src/lib.rs")];
         // Root-level "src" deleted
         let deleted: HashSet<String> = ["src".to_string()].into_iter().collect();
-        let deleted_dir_prefixes: Vec<String> = deleted.iter()
-            .map(|d| format!("{}/", d))
-            .collect();
+        let deleted_dir_prefixes: Vec<String> = deleted.iter().map(|d| format!("{}/", d)).collect();
 
         files.retain(|f| {
             if deleted.contains(&f.path) {
                 return false;
             }
-            deleted_dir_prefixes.iter().all(|prefix| !f.path.starts_with(prefix.as_str()))
+            deleted_dir_prefixes
+                .iter()
+                .all(|prefix| !f.path.starts_with(prefix.as_str()))
         });
 
-        assert!(files.is_empty(), "All files should be removed when parent dir is deleted");
+        assert!(
+            files.is_empty(),
+            "All files should be removed when parent dir is deleted"
+        );
     }
 }
-
