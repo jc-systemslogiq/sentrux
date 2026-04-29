@@ -134,6 +134,33 @@ enum Command {
         format: OutputFormat,
     },
 
+    /// Simulate an architecture graph change without editing files
+    WhatIf {
+        /// Directory to inspect
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Remove an import edge, formatted as from:to
+        #[arg(long)]
+        remove_edge: Option<String>,
+
+        /// Remove one file from the graph
+        #[arg(long)]
+        remove_file: Option<String>,
+
+        /// Move one file, formatted as old:new
+        #[arg(long)]
+        move_file: Option<String>,
+
+        /// Break a cycle, formatted as comma-separated files
+        #[arg(long)]
+        break_cycle: Option<String>,
+
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+
     /// Open the GUI with a pre-loaded directory
     Scan {
         /// Directory to visualize
@@ -263,6 +290,9 @@ pub fn run() -> eframe::Result<()> {
         }
         Some(Command::FileDetail { path, file, format }) => {
             std::process::exit(run_file_detail(&path, &file, format));
+        }
+        Some(Command::WhatIf { path, remove_edge, remove_file, move_file, break_cycle, format }) => {
+            std::process::exit(run_what_if(&path, remove_edge, remove_file, move_file, break_cycle, format));
         }
         Some(Command::Mcp) => {
             app::mcp_server::run_mcp_server(None);
@@ -742,6 +772,120 @@ fn print_file_detail_report(report: &metrics::advisor::FileDetailReport) {
             function.cyclomatic_complexity.unwrap_or(0)
         );
     }
+}
+
+fn parse_what_if_action(
+    remove_edge: Option<String>,
+    remove_file: Option<String>,
+    move_file: Option<String>,
+    break_cycle: Option<String>,
+) -> Result<metrics::whatif::WhatIfAction, String> {
+    let count = remove_edge.is_some() as usize
+        + remove_file.is_some() as usize
+        + move_file.is_some() as usize
+        + break_cycle.is_some() as usize;
+    if count != 1 {
+        return Err("provide exactly one what-if action".into());
+    }
+
+    if let Some(edge) = remove_edge {
+        let (from, to) = split_pair(&edge, "remove-edge")?;
+        return Ok(metrics::whatif::WhatIfAction::RemoveEdge { from, to });
+    }
+    if let Some(path) = remove_file {
+        return Ok(metrics::whatif::WhatIfAction::RemoveFile { path });
+    }
+    if let Some(pair) = move_file {
+        let (old_path, new_path) = split_pair(&pair, "move-file")?;
+        return Ok(metrics::whatif::WhatIfAction::MoveFile { old_path, new_path });
+    }
+    if let Some(files) = break_cycle {
+        let values: Vec<String> = files
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from)
+            .collect();
+        if values.len() < 2 {
+            return Err("break-cycle requires at least two comma-separated files".into());
+        }
+        return Ok(metrics::whatif::WhatIfAction::BreakCycle { files: values });
+    }
+    Err("provide exactly one what-if action".into())
+}
+
+fn split_pair(value: &str, flag: &str) -> Result<(String, String), String> {
+    let Some((left, right)) = value.split_once(':') else {
+        return Err(format!("{flag} expects left:right"));
+    };
+    if left.trim().is_empty() || right.trim().is_empty() {
+        return Err(format!("{flag} expects non-empty left:right"));
+    }
+    Ok((left.trim().into(), right.trim().into()))
+}
+
+fn run_what_if(
+    path: &str,
+    remove_edge: Option<String>,
+    remove_file: Option<String>,
+    move_file: Option<String>,
+    break_cycle: Option<String>,
+    format: OutputFormat,
+) -> i32 {
+    let action = match parse_what_if_action(remove_edge, remove_file, move_file, break_cycle) {
+        Ok(action) => action,
+        Err(e) => {
+            eprintln!("Invalid what-if action: {e}");
+            return 2;
+        }
+    };
+    let root = std::path::Path::new(path);
+    if !root.is_dir() {
+        eprintln!("Error: not a directory: {path}");
+        return 1;
+    }
+
+    eprintln!("Scanning {path}...");
+    let result = match analysis::scanner::scan_directory(
+        path, None, None,
+        &cli_scan_limits(),
+        None,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Scan failed: {e}");
+            return 1;
+        }
+    };
+    let report = metrics::whatif::simulate(
+        &result.snapshot.import_graph,
+        &result.snapshot.entry_points,
+        &action,
+    );
+
+    match format {
+        OutputFormat::Text => print_what_if_report(&report),
+        OutputFormat::Json => match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("Failed to render JSON: {e}");
+                return 1;
+            }
+        },
+    }
+    0
+}
+
+fn print_what_if_report(report: &metrics::whatif::WhatIfResult) {
+    println!("sentrux what-if\n");
+    println!("Action: {}", report.action_description);
+    println!("Score:  {} -> {}", report.score_before, report.score_after);
+    println!("Depth:  {} -> {}", report.max_level_before, report.max_level_after);
+    println!("Blast:  {} -> {}", report.max_blast_before, report.max_blast_after);
+    println!(
+        "Result: {}",
+        if report.improved { "improves architecture" } else { "does not improve architecture" }
+    );
 }
 
 fn print_file_metric_section(
@@ -1407,5 +1551,33 @@ mod tests {
             }
             _ => panic!("expected file-detail command"),
         }
+    }
+
+    #[test]
+    fn parses_what_if_remove_edge_action() {
+        let action = parse_what_if_action(
+            Some("a.rs:b.rs".into()),
+            None,
+            None,
+            None,
+        ).unwrap();
+        match action {
+            metrics::whatif::WhatIfAction::RemoveEdge { from, to } => {
+                assert_eq!(from, "a.rs");
+                assert_eq!(to, "b.rs");
+            }
+            _ => panic!("expected remove edge"),
+        }
+    }
+
+    #[test]
+    fn rejects_multiple_what_if_actions() {
+        let error = parse_what_if_action(
+            Some("a.rs:b.rs".into()),
+            Some("a.rs".into()),
+            None,
+            None,
+        ).unwrap_err();
+        assert!(error.contains("exactly one"));
     }
 }

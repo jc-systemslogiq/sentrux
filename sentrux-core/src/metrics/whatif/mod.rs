@@ -37,7 +37,7 @@ pub enum WhatIfAction {
 }
 
 /// Result of a what-if simulation — before/after comparison of architecture metrics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct WhatIfResult {
     /// Human-readable description of the simulated action
     pub action_description: String,
@@ -73,7 +73,7 @@ pub struct WhatIfResult {
 }
 
 /// A single file's level change from a what-if simulation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct LevelChange {
     /// File path that changed level
     pub file: String,
