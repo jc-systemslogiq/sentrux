@@ -4,6 +4,10 @@
 //! the main thread — spawns a background thread. Collects the same data
 //! that VS Code, Next.js, Homebrew, Cargo, and npm collect.
 //!
+//! This fork is used as a local developer tool for private repositories. All
+//! update checks and telemetry recording are intentionally disabled here; keep
+//! the public API intact so the rest of the application can call it safely.
+//!
 //! ## Design (race-free)
 //!
 //! All telemetry state is protected by `TELEMETRY_LOCK` (a `Mutex`).
@@ -28,7 +32,7 @@
 //! Respects SENTRUX_DEV=1 to tag pings as internal/dev traffic.
 
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Stores the latest available version if newer than current.
@@ -36,24 +40,6 @@ static LATEST_VERSION: Mutex<Option<String>> = Mutex::new(None);
 
 /// Check if a newer version is available. Returns Some(version_string).
 pub fn available_update() -> Option<String> {
-    // Try memory first
-    if let Ok(guard) = LATEST_VERSION.lock() {
-        if let Some(v) = guard.as_ref() {
-            return Some(v.clone());
-        }
-    }
-    // Try disk cache
-    if let Some(path) = latest_version_cache_path() {
-        if let Ok(v) = std::fs::read_to_string(&path) {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                if let Ok(mut guard) = LATEST_VERSION.lock() {
-                    *guard = Some(v.clone());
-                }
-                return Some(v);
-            }
-        }
-    }
     None
 }
 
@@ -208,29 +194,15 @@ fn load_pending_from_disk() -> TelemetrySnapshot {
 
 /// Record a scan event (called from scanner).
 pub fn record_scan(file_count: u32, quality_signal: f64) {
-    let q = (quality_signal * 10000.0).round() as u32;
-    if let Ok(mut state) = TELEMETRY_LOCK.lock() {
-        state.scans += 1;
-        state.files = file_count;
-        state.grade = q;
-        state.persist();
-    }
+    let _ = (file_count, quality_signal);
 }
 
 /// Record an MCP tool call.
 pub fn record_mcp_call() {
-    if let Ok(mut state) = TELEMETRY_LOCK.lock() {
-        state.mcp_calls += 1;
-        state.persist();
-    }
 }
 
 /// Record a gate run.
 pub fn record_gate_run() {
-    if let Ok(mut state) = TELEMETRY_LOCK.lock() {
-        state.gate_runs += 1;
-        state.persist();
-    }
 }
 
 // ── Cache ──
@@ -332,14 +304,7 @@ fn is_new_user() -> bool {
 
 /// Spawn a background thread that sends the daily ping.
 pub fn check_for_updates_async(current_version: &str) {
-    if !should_check() {
-        return;
-    }
-    let version = current_version.to_string();
-    std::thread::Builder::new()
-        .name("update-check".into())
-        .spawn(move || { check_and_notify(&version); })
-        .ok();
+    let _ = current_version;
 }
 
 /// The daily ping — sends version + platform + usage stats.

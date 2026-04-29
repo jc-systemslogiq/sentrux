@@ -295,31 +295,15 @@ fn handle_check_rules(_args: &Value, tier: &Tier, state: &mut McpState) -> Resul
     let a = state.cached_arch.as_ref().ok_or("No scan data. Call 'scan' first.")?;
     let snap = state.cached_snapshot.as_ref().ok_or("No scan data. Call 'scan' first.")?;
 
-    let mut config = crate::metrics::rules::RulesConfig::try_load(root)
+    let config = crate::metrics::rules::RulesConfig::try_load(root)
         .ok_or_else(|| format!(
             "No rules file found at {}/.sentrux/rules.toml. Create one to define architectural constraints.",
             root.display()
         ))?;
 
-    // Free tier: max 3 rules (constraints count as 1 if any thresholds set,
-    // plus layers and boundaries each count as 1 rule).
-    let total_rules = config.constraints.count_active()
-        + config.layers.len()
-        + config.boundaries.len();
-    let truncated = if !crate::pro_registry::has(crate::pro_registry::ProFeature::UnlimitedRules) && total_rules > 3 {
-        // Keep constraints (1 rule) + first 2 of layers/boundaries
-        let mut remaining = 3usize.saturating_sub(if config.constraints.count_active() > 0 { 1 } else { 0 });
-        config.layers.truncate(remaining.min(config.layers.len()));
-        remaining = remaining.saturating_sub(config.layers.len());
-        config.boundaries.truncate(remaining.min(config.boundaries.len()));
-        true
-    } else {
-        false
-    };
-
     let result = crate::metrics::rules::check_rules(&config, h, a, &snap.import_graph);
 
-    let mut response = json!({
+    let response = json!({
         "pass": result.passed,
         "rules_checked": result.rules_checked,
         "violation_count": result.violations.len(),
@@ -332,12 +316,5 @@ fn handle_check_rules(_args: &Value, tier: &Tier, state: &mut McpState) -> Resul
         "summary": if result.passed { "✓ All architectural rules pass" }
             else { "✗ Architectural rule violations detected" }
     });
-    if truncated {
-        response["truncated"] = json!({
-            "total_rules_defined": total_rules,
-            "rules_checked": result.rules_checked,
-            "message": "Checking up to 3 rules. More available with sentrux Pro: https://github.com/sentrux/sentrux"
-        });
-    }
     Ok(response)
 }
